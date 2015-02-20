@@ -3,6 +3,7 @@
 
 #include "positions.h"
 #include "spritesheet.h"
+#include "bitmap.h"
 
 #define POSITION_MELTED_0_LEFT_TOP     {68,  21}
 #define POSITION_MELTED_0_TOP_RIGHT    {92,  12}
@@ -20,7 +21,7 @@
 #define POSITION_MELTED_3_RIGHT_BOTTOM {65, 135}
 
 
-void draw_digit_external_melted_parts(uint8_t position, uint8_t digit, GContext *ctx, bool steel_offset) {
+void draw_digit_external_melted_parts(uint8_t position, uint8_t digit, GBitmap* bmp, bool steel_offset) {
   SpriteId melted_sprites[2];
   GPoint positions[2];
   int count = 1;
@@ -131,7 +132,7 @@ void draw_digit_external_melted_parts(uint8_t position, uint8_t digit, GContext 
     GBitmap* melted_part = gbitmap_create_with_sprite(melted_sprites[i]);
     GRect rect = (GRect){ positions[i], melted_part->bounds.size };
     if (steel_offset) rect.origin.y += SteelOffsetPixels;
-    graphics_draw_bitmap_in_rect(ctx, melted_part, rect);
+    if (bmp) drawBitmapInBitmap(bmp, rect.origin, melted_part);
     gbitmap_destroy(melted_part);
   }
 }

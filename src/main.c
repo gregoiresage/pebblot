@@ -6,6 +6,7 @@
 #include "symmetry.h"
 #include "positions.h"
 #include "spritesheet.h"
+#include "bitmap.h"
 
 typedef struct DisplayState {
   uint8_t digits[4];
@@ -22,18 +23,64 @@ static Settings *settings;
 static Window *window;
 static Layer *canvas;
 static InverterLayer *inverter;
-static GBitmap* digit_bitmaps[4];
 static uint8_t loaded_digits[4];
+
+static MyGPath* digit_from_bitmaps[4];
+static MyGPath* digit_to_bitmaps[4];
+static GPath* animated_bitmaps[4];
+static bool animated[4];
+
+static GBitmap* tmp_bitmap;
+static GSize tmp_bitmap_size = {144, 168};
+
+static AppTimer* timer;
+static int percent = 0;
+static int interval = 10;
 
 void update_inverter(bool bt_connected) {
   state->bt_connected = bt_connected;
   state->inverted = (settings->bgcolor == GColorWhite) ^ (!state->bt_connected && settings->bt_invert);
-  layer_set_hidden(inverter_layer_get_layer(inverter), !state->inverted);
+  layer_set_hidden(inverter_layer_get_layer(inverter), state->inverted);
   layer_mark_dirty(inverter_layer_get_layer(inverter));
 }
 
+static void timer_callback(void *data) {
+  timer = NULL;
+
+  if(percent == 100){
+    for(int i=0; i<4; i++){
+      animated[i] = false;
+      if(animated_bitmaps[i]){
+        free(animated_bitmaps[i]->points);
+        gpath_destroy(animated_bitmaps[i]);
+        animated_bitmaps[i] = NULL;
+      }
+    }
+    percent = 0;
+  }
+  else {
+    for(int i=0; i<4; i++){
+      if(animated[i]){
+        if(animated_bitmaps[i]){
+          free(animated_bitmaps[i]->points);
+          gpath_destroy(animated_bitmaps[i]);
+          animated_bitmaps[i] = NULL;
+        }
+        if(digit_from_bitmaps[i] && digit_to_bitmaps[i])
+          animated_bitmaps[i] = gpath2gpath(digit_from_bitmaps[i], digit_to_bitmaps[i], percent);
+      }
+    }
+    timer = app_timer_register(100, timer_callback, NULL);
+    percent += interval;
+  }
+
+  layer_mark_dirty(canvas);
+  update_inverter(bluetooth_connection_service_peek());
+}
+
 void update_screen() {
-  bool hour24;
+ bool hour24;
+
   if (settings->time_display == TimeDispModeAuto) {
     hour24 = clock_is_24h_style();
   } else {
@@ -43,10 +90,6 @@ void update_screen() {
   time_t now = time(NULL);
   struct tm * tm_now = localtime(&now);
 
-  for (int i = 0; i < 4; i++) {
-    state->digits[i] = get_time_digit(i, tm_now, hour24);
-  }
-
   state->symmetry = settings->screen_mode != ScreenModeSimple;
   state->melted = settings->screen_mode == ScreenModeInsane;
   if (settings->steel_offset == SteelOffsetAuto) {
@@ -55,29 +98,74 @@ void update_screen() {
     state->steel_offset = settings->steel_offset;
   }
 
-  layer_mark_dirty(canvas);
-  update_inverter(bluetooth_connection_service_peek());
+  // Create 'from' pathes (copy of the 'to' pathes)
+  for (int i = 0; i < 4; i++) {
+    if(digit_from_bitmaps[i]){
+      free(digit_from_bitmaps[i]->path->points);
+      gpath_destroy(digit_from_bitmaps[i]->path);
+      free(digit_from_bitmaps[i]);
+    }
+    digit_from_bitmaps[i] = digit_to_bitmaps[i];
+  }
+
+  for (int i = 0; i < 4; i++) {
+    state->digits[i] = get_time_digit(i, tm_now, hour24);
+    if (loaded_digits[i] != state->digits[i]) {
+      loaded_digits[i] = state->digits[i];
+      animated[i] = true;
+    }
+    else {
+      // if(digit_from_bitmaps[i]){
+      //   free(digit_from_bitmaps[i]->points);
+      //   gpath_destroy(digit_from_bitmaps[i]);
+      //   digit_from_bitmaps[i] = NULL;
+      // }
+      animated[i] = false;
+    }
+  }
+
+  // Clear bitmap
+  memset(tmp_bitmap->addr, 0xFF, tmp_bitmap->row_size_bytes * tmp_bitmap->bounds.size.h);
+
+  // Create 'to' bitmaps
+  for (int i = 0; i < 4; i++) {
+    GBitmap* tmp = get_digit_bitmap(i, state->digits[i]);
+    GPoint offset = get_digit_position(i, state->steel_offset).origin;
+    drawBitmapInBitmap(tmp_bitmap, offset, tmp);
+    // if (state->melted) 
+    {
+      draw_digit_external_melted_parts(i, state->digits[i], tmp_bitmap, state->steel_offset);
+    }
+    gbitmap_destroy(tmp);
+  }
+
+  // Create 'to' pathes
+  for (int i = 0; i < 4; i++) {
+    GRect bounds = get_zone_position(i, state->steel_offset);
+    GBitmap* sub = gbitmap_create_as_sub_bitmap(tmp_bitmap, bounds);
+    digit_to_bitmaps[i] = gpath_create_from_bitmap(sub);
+    gbitmap_destroy(sub);
+  }
+
+  if(timer){
+    app_timer_cancel(timer);
+  }
+  timer = app_timer_register(10, timer_callback, NULL);
 }
 
 static void update_canvas(struct Layer *layer, GContext *ctx) {
-  graphics_context_set_compositing_mode(ctx, GCompOpSet);
   for (int i = 0; i < 4; i++) {
-
-    if (!(loaded_digits[i] == state->digits[i] && digit_bitmaps[i])) {
-      if(digit_bitmaps[i]) {
-        gbitmap_destroy(digit_bitmaps[i]);
-      }
-      digit_bitmaps[i] = get_digit_bitmap(i, state->digits[i]);
-      loaded_digits[i] = state->digits[i];
+    if(animated_bitmaps[i]){
+      gpath_draw_filled(ctx, animated_bitmaps[i]);
     }
-    graphics_draw_bitmap_in_rect(ctx, digit_bitmaps[i], get_digit_position(i, state->steel_offset));
-
-    if (state->melted) {
-      draw_digit_external_melted_parts(i, state->digits[i], ctx, state->steel_offset);
+    else if(digit_to_bitmaps[i]) {
+      gpath_draw_filled(ctx, digit_to_bitmaps[i]->path);
+      gpath_draw_outline(ctx, digit_to_bitmaps[i]->path);
     }
-
   }
-  if (state->symmetry) {
+  
+  // if (state->symmetry) 
+  {
     GBitmap* buffer = graphics_capture_frame_buffer(ctx);
     pebblot_symmetry(buffer, state->steel_offset);
     graphics_release_frame_buffer(ctx, buffer);
@@ -85,7 +173,7 @@ static void update_canvas(struct Layer *layer, GContext *ctx) {
 }
 
 static void window_load(Window *window) {
-  window_set_background_color(window, GColorBlack);
+  // window_set_background_color(window, GColorBlack);
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
 
@@ -96,15 +184,48 @@ static void window_load(Window *window) {
   inverter = inverter_layer_create(bounds);
   layer_add_child(window_layer, inverter_layer_get_layer(inverter));
 
-  update_screen();
+  tmp_bitmap = gbitmap_create_blank(tmp_bitmap_size);
+  memset(tmp_bitmap->addr, 0xFF, tmp_bitmap->row_size_bytes * tmp_bitmap->bounds.size.h);
+
+  memset(state->digits, 0, 4);
+
+  // init bitmap
+  for (int i = 0; i < 4; i++) {
+    GBitmap* tmp = get_digit_bitmap(i, state->digits[i]);
+    GPoint offset = get_digit_position(i, state->steel_offset).origin;
+    drawBitmapInBitmap(tmp_bitmap, offset, tmp);
+    gbitmap_destroy(tmp);
+  }
+
+  // Create 'to' pathes
+  for (int i = 0; i < 4; i++) {
+    GRect bounds = get_zone_position(i, state->steel_offset);
+    GBitmap* sub = gbitmap_create_as_sub_bitmap(tmp_bitmap, bounds);
+    digit_to_bitmaps[i] = gpath_create_from_bitmap(sub);
+    gbitmap_destroy(sub);
+  }
 }
 
 static void window_unload(Window *window) {
   layer_destroy(canvas);
   inverter_layer_destroy(inverter);
   for (int i = 0; i < 4; i++) {
-    if(digit_bitmaps[i]) gbitmap_destroy(digit_bitmaps[i]);
+    if(animated_bitmaps[i]) {
+      free(animated_bitmaps[i]->points);
+      gpath_destroy(animated_bitmaps[i]);
+    }
+    if(digit_from_bitmaps[i]) {
+      free(digit_from_bitmaps[i]->path->points);
+      gpath_destroy(digit_from_bitmaps[i]->path);
+      free(digit_from_bitmaps[i]);
+    }
+    if(digit_to_bitmaps[i]) {
+      free(digit_to_bitmaps[i]->path->points);
+      gpath_destroy(digit_to_bitmaps[i]->path);
+      free(digit_to_bitmaps[i]);
+    }
   }
+  gbitmap_destroy(tmp_bitmap);
 }
 
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
